@@ -28,22 +28,25 @@ class Scheduler:
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or \
+                not self.block_manager.can_allocate_prefill(seq):
                 break
             num_seqs += 1
-            self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            self.block_manager.allocate_prefill(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_prefill_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
-            return scheduled_seqs, True
+            return scheduled_seqs, True, False
 
         # decode
+        is_spec_decode = False
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            is_spec_decode = is_spec_decode or seq.merge_spec_tokens()
+            while not self.block_manager.can_allocate_decode(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -51,21 +54,34 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.allocate_decode(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, False, is_spec_decode
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+    def postprocess(
+        self, 
+        seqs: list[Sequence],
+        token_ids: list[int],
+        token_start_indices: list[int],
+    ) -> list[bool]:
+        # append the end idx
+        token_start_indices.append(None)
+        for i, seq in enumerate(seqs):
+            seq.extend_tokens(
+                token_ids[
+                    token_start_indices[i]: 
+                    token_start_indices[i + 1]
+                ]
+            )
+            self.block_manager.deallocate_decode(seq)
+            if (not seq.ignore_eos and seq.last_token == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

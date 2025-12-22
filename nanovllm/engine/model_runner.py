@@ -8,6 +8,8 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.rejection_sampler import RejectionSampler
+from nanovllm.spec_decode.ngram_proposer import NgramProposer
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -30,7 +32,12 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        
+        # spec decode relative
         self.sampler = Sampler()
+        self.rejection_sampler = RejectionSampler(self.sampler)
+        self.drafter = NgramProposer()
+        
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -94,7 +101,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        self.run(seqs, True, False)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -118,6 +125,7 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        # block table shape [num_seqs, max_block_len]
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -134,9 +142,9 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
+            input_ids.extend(seq[seq.num_cached_prefill_tokens:])
+            positions.extend(list(range(seq.num_cached_prefill_tokens, seqlen)))
+            seqlen_q = seqlen - seq.num_cached_prefill_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -158,7 +166,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, False, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -176,13 +184,65 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
+
+    def prepare_spec_decode(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            # length
+            seqlen = len(seq)
+            seqlen_q = len(seq.decode_tokens)
+            seqlen_k = seqlen
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            # tokens
+            input_ids.extend(seq.decode_tokens)
+            positions.append(seq.decode_position)
+            context_lens.append(seqlen)
+            slot_mapping.append(seq.decode_slot_mapping)
+        positions = torch.concatenate(positions, dim=0).tolist() # flatten positions
+        slot_mapping = torch.concatenate(slot_mapping, dim=0).tolist()
+        
+        # prepare tensors
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        
+        assert slot_mapping.numel() == input_ids.numel()
+        assert positions.numel() == input_ids.numel()
+        # set context
+        set_context(
+            is_prefill=False, 
+            is_spec_decode=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping, 
+            context_lens=context_lens, 
+            block_tables=block_tables,
+        )
+        
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
-            temperatures.append(seq.temperature)
+            temperatures.extend([seq.temperature] * seq.num_decode_tokens)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
@@ -205,13 +265,26 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], is_prefill: bool, is_spec_decode: bool) -> list[int]:
+        # prepare for forward
+        if is_prefill: prepare_func = self.prepare_prefill
+        elif is_spec_decode: prepare_func = self.prepare_spec_decode
+        else : prepare_func = self.prepare_decode
+        input_ids, positions = prepare_func(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        
+        # forward
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        
+        # sample
+        token_ids, token_start_indices = self.rejection_sampler(seqs, logits, temperatures) if self.rank == 0 else None
+        
         reset_context()
-        return token_ids
+        return token_ids.tolist(), token_start_indices.tolist()
+    
+    def sample_drafts(self, seqs: list[Sequence]):
+        for seq in seqs:
+            seq.spec_tokens = self.drafter.propose(seq.token_ids) 
 
     @torch.inference_mode()
     def capture_cudagraph(self):

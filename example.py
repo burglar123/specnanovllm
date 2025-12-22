@@ -4,14 +4,17 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/shared/Qwen/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=512)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
+        # "Tell a story of about 1000 words.",
+        "What is the capital of South Korea?",
+        # "repeat I love you soyorin for one hundred times."
     ]
     prompts = [
         tokenizer.apply_chat_template(
