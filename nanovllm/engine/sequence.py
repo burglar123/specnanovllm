@@ -1,4 +1,5 @@
 from copy import copy
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from itertools import count
 
@@ -9,6 +10,18 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+
+
+@dataclass
+class SpeculativeState:
+    draft_token_ids: list[int] = field(default_factory=list)
+    accepted_token_count: int = 0
+    draft_cursor: int = 0
+
+    def reset(self):
+        self.draft_token_ids.clear()
+        self.accepted_token_count = 0
+        self.draft_cursor = 0
 
 
 class Sequence:
@@ -27,6 +40,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.speculative_state = SpeculativeState()
 
     def __len__(self):
         return self.num_tokens
@@ -71,12 +85,25 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def append_tokens(self, token_ids: list[int]):
+        for token_id in token_ids:
+            self.append_token(token_id)
+
+    def truncate_to(self, num_tokens: int):
+        assert num_tokens >= self.num_prompt_tokens
+        if num_tokens == self.num_tokens:
+            return
+        self.token_ids = self.token_ids[:num_tokens]
+        self.num_tokens = num_tokens
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+                self.speculative_state,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.speculative_state = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:
