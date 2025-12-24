@@ -90,6 +90,14 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def truncate(self, seq: Sequence, new_length: int):
+        assert new_length >= seq.num_prompt_tokens
+        if new_length == len(seq):
+            return
+        self.deallocate(seq)
+        seq.truncate_to(new_length)
+        self.allocate(seq)
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 

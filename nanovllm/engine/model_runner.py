@@ -213,6 +213,17 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def run_draft(self, seqs: list[Sequence], is_prefill: bool, max_draft_tokens: int) -> list[list[int]]:
+        draft_tokens: list[list[int]] = [[] for _ in seqs]
+        for _ in range(max_draft_tokens):
+            token_ids = self.run(seqs, is_prefill)
+            for idx, token_id in enumerate(token_ids):
+                draft_tokens[idx].append(token_id)
+        return draft_tokens
+
+    def run_verify(self, seqs: list[Sequence], draft_token_ids: list[list[int]]):
+        raise NotImplementedError("Verification API is reserved for speculative decoding.")
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
