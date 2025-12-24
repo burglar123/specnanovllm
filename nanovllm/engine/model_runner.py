@@ -14,7 +14,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], shm_name: str = "nanovllm"):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -22,8 +22,10 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.shm_name = shm_name
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if not dist.is_initialized():
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -40,11 +42,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=self.shm_name)
                 self.loop()
 
     def exit(self):
@@ -222,7 +224,50 @@ class ModelRunner:
         return draft_tokens
 
     def run_verify(self, seqs: list[Sequence], draft_token_ids: list[list[int]]):
-        raise NotImplementedError("Verification API is reserved for speculative decoding.")
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        q_lens = []
+        for seq, draft_tokens in zip(seqs, draft_token_ids):
+            num_draft_tokens = len(draft_tokens)
+            q_len = num_draft_tokens + 1
+            start = len(seq) - num_draft_tokens
+            prefix_pos = start - 1
+            input_ids.append(seq.token_ids[prefix_pos])
+            positions.append(prefix_pos)
+            slot_mapping.append(-1)
+            input_ids.extend(draft_tokens)
+            positions.extend(list(range(start, len(seq))))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
+            max_seqlen_q = max(max_seqlen_q, q_len)
+            max_seqlen_k = max(max_seqlen_k, len(seq))
+            for pos in range(start, len(seq)):
+                block_id = seq.block_table[pos // self.block_size]
+                slot_mapping.append(block_id * self.block_size + (pos % self.block_size))
+            q_lens.append(q_len)
+        block_tables = self.prepare_block_tables(seqs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        logits = self.run_model(input_ids, positions, True)
+        reset_context()
+        if self.rank != 0:
+            return None
+        outputs = []
+        offset = 0
+        for q_len, draft_tokens in zip(q_lens, draft_token_ids):
+            seq_logits = logits[offset:offset + q_len]
+            outputs.append(seq_logits[1:1 + len(draft_tokens)])
+            offset += q_len
+        return outputs
 
     @torch.inference_mode()
     def capture_cudagraph(self):

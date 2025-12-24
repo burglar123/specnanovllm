@@ -118,3 +118,8 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def may_append_n(self, seq: Sequence, token_ids: list[int]):
+        for token_id in token_ids:
+            self.may_append(seq)
+            seq.append_token(token_id)

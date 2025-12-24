@@ -10,12 +10,23 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.engine.speculative import DefaultDecodingStrategy, DecodingStrategy
+from nanovllm.engine.speculative import (
+    DefaultDecodingStrategy,
+    DecodingStrategy,
+    SingleDraftSingleTargetStrategy,
+    SpeculativeConfig,
+)
 
 
 class LLMEngine:
 
-    def __init__(self, model, decoding_strategy: DecodingStrategy | None = None, **kwargs):
+    def __init__(
+        self,
+        model,
+        decoding_strategy: DecodingStrategy | None = None,
+        speculative_config: SpeculativeConfig | None = None,
+        **kwargs,
+    ):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -28,15 +39,24 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.target_model_runner = ModelRunner(config, 0, self.events, shm_name="nanovllm_target")
+        self.model_runner = self.target_model_runner
+        self.draft_model_runner = None
+        if speculative_config and speculative_config.draft_model:
+            draft_config = Config(speculative_config.draft_model, **config_kwargs)
+            self.draft_model_runner = ModelRunner(draft_config, 0, [], shm_name="nanovllm_draft")
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        if decoding_strategy is None and speculative_config and speculative_config.draft_model:
+            decoding_strategy = SingleDraftSingleTargetStrategy(speculative_config)
         self.decoding_strategy = decoding_strategy or DefaultDecodingStrategy()
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        self.target_model_runner.call("exit")
+        if self.draft_model_runner:
+            self.draft_model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
