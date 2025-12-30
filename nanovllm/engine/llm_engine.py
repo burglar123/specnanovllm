@@ -44,6 +44,9 @@ class LLMEngine:
         self.draft_model_runner = None
         if speculative_config and speculative_config.draft_model:
             draft_config = Config(speculative_config.draft_model, **config_kwargs)
+
+            draft_config.gpu_memory_utilization = 0.95
+
             self.draft_model_runner = ModelRunner(draft_config, 0, [], shm_name="nanovllm_draft")
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id

@@ -55,10 +55,17 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
+        
+        # 修改点1：使用 hasattr 防止初始化失败时属性不存在导致 AttributeError
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            if hasattr(self, 'graphs'): del self.graphs
+            if hasattr(self, 'graph_pool'): del self.graph_pool
+            
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+
+        # 修改点2：删除无条件的销毁，只保留这个带检查的销毁
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
