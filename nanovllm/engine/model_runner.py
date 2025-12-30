@@ -272,7 +272,7 @@ class ModelRunner:
         offset = 0
         for q_len, draft_tokens in zip(q_lens, draft_token_ids):
             seq_logits = logits[offset:offset + q_len]
-            outputs.append(seq_logits[0 : len(draft_tokens)])
+            outputs.append(seq_logits[:len(draft_tokens)])
             offset += q_len
         return outputs
 
